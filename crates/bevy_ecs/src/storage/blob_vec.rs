@@ -5,7 +5,29 @@ use std::{
     ptr::NonNull,
 };
 
-use bevy_ptr::{OwningPtr, Ptr, PtrMut};
+/// The maximum SIMD alignment for a given target.
+/// `MAX_SIMD_ALIGNMENT` is 64 for the following reasons:
+///  1. This ensures that table columns are aligned to cache lines on x86
+///  2. 64 is the maximum alignment required to use all instructions on all known CPU architectures.
+///     This simplifies greatly handling cross platform alignment on a case by case basis; by aligning to the worst case, we align for all cases
+///  3. The overhead of aligning columns to 64 bytes is very small as columns will in general be much larger than this
+pub const MAX_SIMD_ALIGNMENT: usize = 64; //Must be greater than zero!
+
+/*
+If this is a problem, this can be replaced with code that looks something like the following:
+
+    #[cfg(all(any(target_feature = "avx"), not(target_feature = "avx512f")))]
+    pub const MAX_SIMD_ALIGNMENT: usize = 32;
+
+    #[cfg(any(target_feature = "avx512f"))]
+    pub const MAX_SIMD_ALIGNMENT: usize = 64;
+
+    //All platforms get 16-byte alignment on tables guaranteed.
+    #[cfg(not(any(target_feature = "avx512f")))]
+    pub const MAX_SIMD_ALIGNMENT: usize = 16;
+*/
+
+use crate::ptr::{OwningPtr, Ptr, PtrMut};
 
 /// A flat, type-erased data storage type
 ///
@@ -46,8 +68,11 @@ impl BlobVec {
         drop: Option<unsafe fn(OwningPtr<'_>)>,
         capacity: usize,
     ) -> BlobVec {
+        let align = NonZeroUsize::new(item_layout.align())
+            .expect("alignment must be > 0")
+            .max(NonZeroUsize::new_unchecked(MAX_SIMD_ALIGNMENT));
+
         if item_layout.size() == 0 {
-            let align = NonZeroUsize::new(item_layout.align()).expect("alignment must be > 0");
             BlobVec {
                 data: bevy_ptr::dangling_with_align(align),
                 capacity: usize::MAX,
@@ -57,7 +82,7 @@ impl BlobVec {
             }
         } else {
             let mut blob_vec = BlobVec {
-                data: NonNull::dangling(),
+                data: bevy_ptr::dangling_with_align(align), // NonNull::dangling(),
                 capacity: 0,
                 len: 0,
                 item_layout,
@@ -289,7 +314,7 @@ impl BlobVec {
         unsafe { PtrMut::new(self.data) }
     }
 
-    /// Get a reference to the entire [`BlobVec`] as if it were an array with elements of type `T`
+    /// Get a reference to the entire [`BlobVec`] as if it were an array with elements of type `T`.
     ///
     /// # Safety
     /// The type `T` must be the type of the items in this [`BlobVec`].
@@ -336,6 +361,9 @@ impl Drop for BlobVec {
 fn array_layout(layout: &Layout, n: usize) -> Option<Layout> {
     let (array_layout, offset) = repeat_layout(layout, n)?;
     debug_assert_eq!(layout.size(), offset);
+
+    //Note: NEEDED for batching.  This is the layout of the array itself, not the layout of its elements.
+    let array_layout = array_layout.align_to(MAX_SIMD_ALIGNMENT).unwrap();
     Some(array_layout)
 }
 

@@ -2,8 +2,9 @@ use crate::{
     component::Component,
     entity::Entity,
     query::{
-        QueryCombinationIter, QueryEntityError, QueryIter, QueryManyIter, QuerySingleError,
-        QueryState, ROQueryItem, ReadOnlyWorldQuery, WorldQuery,
+        QueryBatch, QueryCombinationIter, QueryEntityError, QueryItem, QueryIter, QueryManyIter,
+        QuerySingleError, QueryState, ROQueryBatch, ROQueryItem, ReadOnlyWorldQuery, WorldQuery,
+        WorldQueryBatch,
     },
     world::{Mut, World},
 };
@@ -687,6 +688,28 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> Query<'w, 's, Q, F> {
         };
     }
 
+    /// See [`QueryState<Q,F>::for_each_batched`](QueryState<Q,F>::for_each_batched) for how to use this function.
+    #[inline]
+    pub fn for_each_batched<'a, const N: usize>(
+        &'a mut self,
+        func: impl FnMut(ROQueryItem<'a, Q>),
+        func_batch: impl FnMut(ROQueryBatch<'a, Q, N>),
+    ) where
+        <Q as WorldQuery>::ReadOnly: WorldQueryBatch<N>,
+    {
+        // SAFETY: system runs without conflicts with other systems. same-system queries have runtime
+        // borrow checks when they conflict
+        unsafe {
+            self.state.as_readonly().for_each_unchecked_manual_batched(
+                self.world,
+                func,
+                func_batch,
+                self.last_change_tick,
+                self.change_tick,
+            );
+        };
+    }
+
     /// Runs `f` on each query item.
     ///
     /// # Example
@@ -719,6 +742,116 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> Query<'w, 's, Q, F> {
             self.state.for_each_unchecked_manual(
                 self.world,
                 f,
+                self.last_change_tick,
+                self.change_tick,
+            );
+        };
+    }
+
+    /// This is a "batched" version of [`for_each_mut`](Self::for_each_mut) that accepts a batch size `N`, which should be a power of two.
+    /// The advantage of using batching in queries is that it enables SIMD acceleration (vectorization) of your code to help you meet your performance goals.
+    /// This function accepts two arguments, `func`, and `func_batch` which represent the "scalar" and "vector" (or "batched") paths of your code respectively.
+    /// Each "batch" contains `N` query results, in order.  **Consider enabling AVX if you are on x86 when using this API**.
+    ///
+    /// # A very brief introduction to SIMD
+    ///
+    /// SIMD, or Single Instruction, Multiple Data, is a paradigm that allows a single instruction to operate on multiple datums in parallel.
+    /// It is most commonly seen in "vector" instruction set extensions such as AVX and NEON, where it is possible to, for example, add
+    /// two arrays of `[f32; 4]` together in a single instruction.  When used appropriately, SIMD is a very powerful tool that can greatly accelerate certain types of workloads.
+    /// An introductory treatment of SIMD can be found [on Wikipedia](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) for interested readers.
+    ///
+    /// [Vectorization](https://stackoverflow.com/questions/1422149/what-is-vectorization) is an informal term to describe optimizing code to leverage these SIMD instruction sets.
+    ///
+    /// # When should I consider batching for my query?
+    ///
+    /// The first thing you should consider is if you are meeting your performance goals.  Batching a query is fundamentally an optimization, and if your application is meeting performance requirements
+    /// already, then (other than for your own entertainment) you won't get much benefit out of batching.  If you are having performance problems though, the next step is to
+    /// use a [profiler](https://nnethercote.github.io/perf-book/profiling.html) to determine the running characteristics of your code.
+    /// If, after profiling your code, you have determined that a substantial amount of time is being processing a query, and it's hindering your performance goals,
+    /// then it might be worth it to consider batching to meet them.
+    ///
+    /// One of the main tradeoffs with batching your queries is that there will be an increased complexity from maintaining both code paths: `func` and `func_batch`
+    /// semantically should be doing the same thing, and it should always be possible to interchange them without visible program effects.
+    ///
+    /// # Getting maximum performance for your application
+    ///
+    /// Bevy aims to provide best-in-class performance for architectures that do not encode alignment into SIMD instructions.  This includes (but is not limited to) AVX and onwards for x86,
+    /// ARM 64-bit, RISC-V, and WebAssembly.  The majority of architectures created since 2010 have this property.  It is important to note that although these architectures
+    /// do not encode alignment in the instruction set itself, they still benefit from memory operands being naturally aligned.
+    ///
+    /// On other instruction sets, code generation may be worse than it could be due to alignment information not being statically available in batches.
+    /// For example, 32-bit ARM NEON instructions encode an alignment hint that is not present in the 64-bit ARM versions,
+    /// and this hint will be set to "unaligned" even if the data itself is aligned.  Whether this incurs a performance penalty is implementation defined.
+    ///
+    /// **As a result, it is recommended, if you are on x86, to enable at minimum AVX support for maximum performance when executing batched queries**.
+    /// It's a good idea to enable in general, too.  SSE4.2 and below will have slightly worse performance as more unaligned loads will be produced,
+    /// with work being done in registers, since it requires memory operands to be aligned whereas AVX relaxes this restriction.
+    ///
+    /// To enable AVX support for your application, add "-C target-feature=+avx" to your `RUSTFLAGS`.  See the [Rust docs](https://doc.rust-lang.org/cargo/reference/config.html)
+    /// for details on how to set this as a default for your project.
+    ///
+    /// When the `generic_const_exprs` feature of Rust is stable, Bevy will be able to encode the alignment of the batch into the batch itself and provide maximum performance
+    /// on architectures that encode alignment into SIMD instruction opcodes as well.
+    ///
+    /// # What kinds of queries make sense to batch?
+    ///
+    /// Usually math related ones. Anything involving floats is a possible candidate.  Depending on your component layout, you may need to perform a data layout conversion
+    /// to batch the query optimally.  This Wikipedia page on ["array of struct" and "struct of array" layouts](https://en.wikipedia.org/wiki/AoS_and_SoA) is a good starter on
+    /// this topic, as is this [Intel blog post](https://www.intel.com/content/www/us/en/developer/articles/technical/memory-layout-transformations.html).
+    ///
+    /// Vectorizing code can be a very deep subject to get into.
+    /// Sometimes it can be very straightfoward to accomplish what you want to do, and other times it takes a bit of playing around to make your problem fit the SIMD model.
+    ///
+    /// # Will batching always make my queries faster?
+    ///
+    /// Unfortunately it will not.  A suboptimally written batched query will probably perform worse than a straightforward `for_each_mut` query.  Data layout conversion,
+    /// for example, carries overhead that may not always be worth it. Fortunately, your profiler can help you identify these situations.
+    ///
+    /// Think of batching as a tool in your performance toolbox rather than the preferred way of writing your queries.
+    ///
+    /// # What kinds of queries are batched right now?
+    ///
+    /// Currently, only "Dense" queries are actually batched; other queries will only use `func` and never call `func_batch`.  This will improve
+    /// in the future.
+    ///
+    /// # Usage:
+    ///
+    /// * `N` should be a power of 2, and ideally be a multiple of your SIMD vector size.
+    /// * `func_batch` receives [`Batch`](bevy_ptr::Batch)es of `N` components.
+    /// * `func` functions exactly as does in [`for_each_mut`](Self::for_each_mut) -- it receives "scalar" (non-batched) components.
+    ///
+    /// In other words, `func_batch` composes the "fast path" of your query, and `func` is the "slow path".
+    ///
+    /// In general, when using this function, be mindful of the types of filters being used with your query, as these can fragment your batches
+    /// and cause the scalar path to be taken more often.
+    ///
+    /// **Note**: It is well known that [array::map](https://doc.rust-lang.org/std/primitive.array.html#method.map) optimizes poorly at the moment.
+    /// Avoid using it until the upstream issues are resolved: [#86912](https://github.com/rust-lang/rust/issues/86912) and [#102202](https://github.com/rust-lang/rust/issues/102202).
+    /// Manually unpack your batches in the meantime for optimal codegen.
+    ///
+    /// **Note**: It is always valid for the implementation of this function to only call `func`.  Currently, batching is only supported for "Dense" queries.
+    /// Calling this function on any other query type will result in only the slow path being executed (e.g., queries with Sparse components.)
+    /// More query types may become batchable in the future.
+    ///
+    /// **Note**: Although this function provides the groundwork for writing performance-portable SIMD-accelerated queries, you will still need to take into account
+    /// your target architecture's capabilities.  The batch size will likely need to be tuned for your application, for example.
+    /// When SIMD becomes stabilized in Rust, it will be possible to write code that is generic over the batch width, but some degree of tuning will likely always be
+    /// necessary.  Think of this as a tool at your disposal to meet your performance goals.
+    #[inline]
+    pub fn for_each_mut_batched<'a, const N: usize>(
+        &'a mut self,
+        func: impl FnMut(QueryItem<'a, Q>),
+        func_batch: impl FnMut(QueryBatch<'a, Q, N>),
+    ) where
+        Q: WorldQueryBatch<N>,
+    {
+        // SAFETY: system runs without conflicts with other systems. same-system queries have runtime
+        // borrow checks when they conflict
+        unsafe {
+            self.state.for_each_unchecked_manual_batched(
+                self.world,
+                func,
+                func_batch,
                 self.last_change_tick,
                 self.change_tick,
             );
