@@ -5,7 +5,9 @@ use std::{
     ptr::NonNull,
 };
 
-use bevy_ptr::{OwningPtr, Ptr, PtrMut};
+use bevy_ptr::batch::MAX_SIMD_ALIGNMENT;
+
+use crate::ptr::{batch, OwningPtr, Ptr, PtrMut, ThinSimdAlignedSlicePtr};
 
 /// A flat, type-erased data storage type
 ///
@@ -46,8 +48,11 @@ impl BlobVec {
         drop: Option<unsafe fn(OwningPtr<'_>)>,
         capacity: usize,
     ) -> BlobVec {
+        let align = NonZeroUsize::new(item_layout.align())
+            .expect("alignment must be > 0")
+            .max(NonZeroUsize::new_unchecked(MAX_SIMD_ALIGNMENT));
+
         if item_layout.size() == 0 {
-            let align = NonZeroUsize::new(item_layout.align()).expect("alignment must be > 0");
             BlobVec {
                 data: bevy_ptr::dangling_with_align(align),
                 capacity: usize::MAX,
@@ -57,7 +62,7 @@ impl BlobVec {
             }
         } else {
             let mut blob_vec = BlobVec {
-                data: NonNull::dangling(),
+                data: bevy_ptr::dangling_with_align(align), // NonNull::dangling(),
                 capacity: 0,
                 len: 0,
                 item_layout,
@@ -289,13 +294,13 @@ impl BlobVec {
         unsafe { PtrMut::new(self.data) }
     }
 
-    /// Get a reference to the entire [`BlobVec`] as if it were an array with elements of type `T`
+    /// Get a reference to the entire [`BlobVec`] as if it were an array with elements of type `T`.
     ///
     /// # Safety
     /// The type `T` must be the type of the items in this [`BlobVec`].
-    pub unsafe fn get_slice<T>(&self) -> &[UnsafeCell<T>] {
+    pub unsafe fn get_slice<T>(&self) -> ThinSimdAlignedSlicePtr<UnsafeCell<T>> {
         // SAFETY: the inner data will remain valid for as long as 'self.
-        std::slice::from_raw_parts(self.data.as_ptr() as *const UnsafeCell<T>, self.len)
+        ThinSimdAlignedSlicePtr::new(self.data.as_ptr() as *mut UnsafeCell<T>, self.len)
     }
 
     pub fn clear(&mut self) {
@@ -336,6 +341,11 @@ impl Drop for BlobVec {
 fn array_layout(layout: &Layout, n: usize) -> Option<Layout> {
     let (array_layout, offset) = repeat_layout(layout, n)?;
     debug_assert_eq!(layout.size(), offset);
+
+    //Note: NEEDED for batching.  This is the layout of the array itself, not the layout of its elements.
+    let array_layout = array_layout
+        .align_to(batch::MAX_SIMD_ALIGNMENT.into())
+        .unwrap();
     Some(array_layout)
 }
 

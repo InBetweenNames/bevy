@@ -1,3 +1,4 @@
+#![feature(generic_const_exprs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![doc = include_str!("../README.md")]
 

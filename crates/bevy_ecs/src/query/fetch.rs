@@ -1,15 +1,20 @@
 use crate::{
     archetype::{Archetype, ArchetypeComponentId},
-    change_detection::Ticks,
+    change_detection::{MutBatch, Ticks, TicksBatch},
     component::{Component, ComponentId, ComponentStorage, ComponentTicks, StorageType},
     entity::Entity,
+    ptr::{
+        batch::AlignedBatch,
+        elain::{Align, Alignment},
+        ThinSimdAlignedSlicePtr, UnsafeCellDeref,
+    },
     query::{Access, DebugCheckedUnwrap, FilteredAccess},
     storage::{ComponentSparseSet, Table},
     world::{Mut, World},
 };
+
 use bevy_ecs_macros::all_tuples;
 pub use bevy_ecs_macros::WorldQuery;
-use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
 use std::{cell::UnsafeCell, marker::PhantomData};
 
 /// Types that can be fetched from a [`World`] using a [`Query`].
@@ -426,6 +431,29 @@ pub unsafe trait WorldQuery {
     ) -> bool;
 }
 
+/// An extension of [`WorldQuery`] for batched queries.
+pub trait WorldQueryBatch<const N: usize>: WorldQuery
+where
+    Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+{
+    type FullBatch<'w>;
+
+    /// Retrieve a batch of size `N` with desired alignment `ALIGN` from the current table.
+    /// # Safety
+    ///
+    /// `table_row_start` is a valid table row index for the current table
+    /// `table_row_start` + `N` is a valid table row index for the current table
+    /// `table_row_start` is a multiple of `N`
+    ///
+    /// Must always be called _after_ [`WorldQuery::set_table`].
+    unsafe fn fetch_batched<'w>(
+        fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        entity_batch: &'w AlignedBatch<Entity, N>,
+        table_row_start: usize,
+        len: usize,
+    ) -> Self::FullBatch<'w>;
+}
+
 /// A world query that is read only.
 ///
 /// # Safety
@@ -437,10 +465,14 @@ pub unsafe trait ReadOnlyWorldQuery: WorldQuery<ReadOnly = Self> {}
 pub type QueryFetch<'w, Q> = <Q as WorldQuery>::Fetch<'w>;
 /// The item type returned when a [`WorldQuery`] is iterated over
 pub type QueryItem<'w, Q> = <Q as WorldQuery>::Item<'w>;
+/// The item type returned when a [`WorldQuery`] is iterated over in a batched fashion
+pub type QueryBatch<'w, Q, const N: usize> = <Q as WorldQueryBatch<N>>::FullBatch<'w>;
 /// The read-only `Fetch` of a [`WorldQuery`], which is used to store state for each archetype/table.
 pub type ROQueryFetch<'w, Q> = QueryFetch<'w, <Q as WorldQuery>::ReadOnly>;
 /// The read-only variant of the item type returned when a [`WorldQuery`] is iterated over immutably
 pub type ROQueryItem<'w, Q> = QueryItem<'w, <Q as WorldQuery>::ReadOnly>;
+
+pub type ROQueryBatch<'w, Q, const N: usize> = QueryBatch<'w, <Q as WorldQuery>::ReadOnly, N>;
 
 /// SAFETY: no component or archetype access
 unsafe impl WorldQuery for Entity {
@@ -508,13 +540,30 @@ unsafe impl WorldQuery for Entity {
     }
 }
 
+impl<const N: usize> WorldQueryBatch<N> for Entity
+where
+    Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+{
+    type FullBatch<'w> = &'w AlignedBatch<Entity, N>;
+
+    #[inline]
+    unsafe fn fetch_batched<'w>(
+        _fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        entity_batch: &'w AlignedBatch<Entity, N>,
+        _table_row_start: usize,
+        _len: usize,
+    ) -> Self::FullBatch<'w> {
+        entity_batch
+    }
+}
+
 /// SAFETY: access is read only
 unsafe impl ReadOnlyWorldQuery for Entity {}
 
 #[doc(hidden)]
 pub struct ReadFetch<'w, T> {
     // T::Storage = TableStorage
-    table_components: Option<ThinSlicePtr<'w, UnsafeCell<T>>>,
+    table_components: Option<ThinSimdAlignedSlicePtr<'w, UnsafeCell<T>>>,
     // T::Storage = SparseStorage
     sparse_set: Option<&'w ComponentSparseSet>,
 }
@@ -586,8 +635,7 @@ unsafe impl<T: Component> WorldQuery for &T {
             table
                 .get_column(component_id)
                 .debug_checked_unwrap()
-                .get_data_slice()
-                .into(),
+                .get_data_slice(),
         );
     }
 
@@ -649,16 +697,38 @@ unsafe impl<T: Component> WorldQuery for &T {
 /// SAFETY: access is read only
 unsafe impl<T: Component> ReadOnlyWorldQuery for &T {}
 
+impl<T: Component, const N: usize> WorldQueryBatch<N> for &T
+where
+    Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+{
+    type FullBatch<'w> = &'w AlignedBatch<T, N>;
+
+    #[inline]
+    unsafe fn fetch_batched<'w>(
+        fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        _entity_batch: &'w AlignedBatch<Entity, N>,
+        table_row_start: usize,
+        len: usize,
+    ) -> Self::FullBatch<'w> {
+        //TODO: when generalized const expresions are stable, want the following:
+        //gcd::euclid_usize(ptr::MAX_SIMD_ALIGNMENT, N * core::mem::size_of::<T>());
+
+        let components = fetch.table_components.debug_checked_unwrap();
+
+        components.get_batch_aligned_deref::<N>(table_row_start, len)
+    }
+}
+
 #[doc(hidden)]
 pub struct WriteFetch<'w, T> {
     // T::Storage = TableStorage
     table_data: Option<(
-        ThinSlicePtr<'w, UnsafeCell<T>>,
-        ThinSlicePtr<'w, UnsafeCell<ComponentTicks>>,
+        ThinSimdAlignedSlicePtr<'w, UnsafeCell<T>>,
+        ThinSimdAlignedSlicePtr<'w, UnsafeCell<ComponentTicks>>,
     )>,
     // T::Storage = SparseStorage
     sparse_set: Option<&'w ComponentSparseSet>,
-
     last_change_tick: u32,
     change_tick: u32,
 }
@@ -731,10 +801,7 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
         table: &'w Table,
     ) {
         let column = table.get_column(component_id).debug_checked_unwrap();
-        fetch.table_data = Some((
-            column.get_data_slice().into(),
-            column.get_ticks_slice().into(),
-        ));
+        fetch.table_data = Some((column.get_data_slice(), column.get_ticks_slice()));
     }
 
     #[inline(always)]
@@ -804,6 +871,36 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
         set_contains_id: &impl Fn(ComponentId) -> bool,
     ) -> bool {
         set_contains_id(state)
+    }
+}
+
+impl<'__w, T: Component, const N: usize> WorldQueryBatch<N> for &'__w mut T
+where
+    Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    type FullBatch<'w> = MutBatch<'w, T, N>;
+
+    #[inline]
+    unsafe fn fetch_batched<'w>(
+        fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        _entity_batch: &'w AlignedBatch<Entity, N>,
+        table_row_start: usize,
+        len: usize,
+    ) -> Self::FullBatch<'w> {
+        let (table_components, table_ticks) = fetch.table_data.debug_checked_unwrap();
+
+        MutBatch::<T, N> {
+            value: table_components.get_batch_aligned_deref_mut::<N>(table_row_start, len),
+            ticks: TicksBatch {
+                // SAFETY: [table_row_start..+batch.len()] is in range
+                component_ticks: table_ticks.get_batch_aligned_deref_mut::<N>(table_row_start, len),
+                change_tick: fetch.change_tick,
+                last_change_tick: fetch.last_change_tick,
+            },
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -911,6 +1008,33 @@ unsafe impl<T: WorldQuery> WorldQuery for Option<T> {
     }
 }
 
+impl<T: WorldQueryBatch<N>, const N: usize> WorldQueryBatch<N> for Option<T>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+{
+    type FullBatch<'w> = Option<QueryBatch<'w, T, N>>;
+
+    #[inline]
+    unsafe fn fetch_batched<'w>(
+        fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        entity_batch: &'w AlignedBatch<Entity, N>,
+        table_row_start: usize,
+        len: usize,
+    ) -> Self::FullBatch<'w> {
+        if fetch.matches {
+            Some(T::fetch_batched(
+                &mut fetch.fetch,
+                entity_batch,
+                table_row_start,
+                len,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 /// SAFETY: [`OptionFetch`] is read only because `T` is read only
 unsafe impl<T: ReadOnlyWorldQuery> ReadOnlyWorldQuery for Option<T> {}
 
@@ -989,10 +1113,46 @@ impl<T: Component> ChangeTrackers<T> {
     }
 }
 
+/// A batch of [`ChangeTrackers`].  This is used when performing queries with Change Trackers using the
+/// [`Query::for_each_mut_batched`](crate::system::Query::for_each_mut_batched) and [`Query::for_each_batched`](crate::system::Query::for_each_batched) functions.
+#[derive(Clone)]
+pub struct ChangeTrackersBatch<'a, T, const N: usize>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    pub(crate) component_ticks: &'a AlignedBatch<ComponentTicks, N>,
+    pub(crate) last_change_tick: u32,
+    pub(crate) change_tick: u32,
+    marker: PhantomData<T>,
+}
+
+impl<'a, T: Component, const N: usize> ChangeTrackersBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    /// Returns true if this component has been added since the last execution of this system.
+    #[inline]
+    pub fn is_added(&self) -> bool {
+        self.component_ticks
+            .as_array()
+            .iter()
+            .any(|x| x.is_added(self.last_change_tick, self.change_tick))
+    }
+
+    /// Returns true if this component has been changed since the last execution of this system.
+    #[inline]
+    pub fn is_changed(&self) -> bool {
+        self.component_ticks
+            .as_array()
+            .iter()
+            .any(|x| x.is_changed(self.last_change_tick, self.change_tick))
+    }
+}
+
 #[doc(hidden)]
 pub struct ChangeTrackersFetch<'w, T> {
     // T::Storage = TableStorage
-    table_ticks: Option<ThinSlicePtr<'w, UnsafeCell<ComponentTicks>>>,
+    table_ticks: Option<ThinSimdAlignedSlicePtr<'w, UnsafeCell<ComponentTicks>>>,
     // T::Storage = SparseStorage
     sparse_set: Option<&'w ComponentSparseSet>,
 
@@ -1074,8 +1234,7 @@ unsafe impl<T: Component> WorldQuery for ChangeTrackers<T> {
             table
                 .get_column(id)
                 .debug_checked_unwrap()
-                .get_ticks_slice()
-                .into(),
+                .get_ticks_slice(),
         );
     }
 
@@ -1137,6 +1296,33 @@ unsafe impl<T: Component> WorldQuery for ChangeTrackers<T> {
         set_contains_id: &impl Fn(ComponentId) -> bool,
     ) -> bool {
         set_contains_id(id)
+    }
+}
+
+impl<T: Component, const N: usize> WorldQueryBatch<N> for ChangeTrackers<T>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    type FullBatch<'w> = ChangeTrackersBatch<'w, T, N>;
+
+    #[inline]
+    unsafe fn fetch_batched<'w>(
+        fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+        _entity_batch: &'w AlignedBatch<Entity, N>,
+        table_row_start: usize,
+        len: usize,
+    ) -> Self::FullBatch<'w> {
+        ChangeTrackersBatch {
+            component_ticks: {
+                let table_ticks = fetch.table_ticks.debug_checked_unwrap();
+
+                table_ticks.get_batch_aligned_deref::<N>(table_row_start, len)
+            },
+            marker: PhantomData,
+            last_change_tick: fetch.last_change_tick,
+            change_tick: fetch.change_tick,
+        }
     }
 }
 
@@ -1239,9 +1425,32 @@ macro_rules! impl_tuple_fetch {
             }
         }
 
+        //FIXME: the magic can happen here with different ALIGNments!!!
+        #[allow(unused_variables)]
+        #[allow(non_snake_case)]
+        #[allow(clippy::unused_unit)]
+        impl<const N: usize, $($name: WorldQueryBatch<N>),*> WorldQueryBatch<N> for ($($name,)*)
+        where
+            Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+            $(Align<{ crate::ptr::batch::compute_alignment::<$name, { N }>() }>: Alignment,)*
+        {
+            type FullBatch<'w> = ($($name::FullBatch<'w>,)*);
+
+            #[inline]
+            unsafe fn fetch_batched<'w>(
+                _fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+                _entity_batch: &'w AlignedBatch<Entity, N>,
+                _table_row_start: usize,
+                _len: usize,
+            ) -> Self::FullBatch<'w>
+            {
+                let ($($name,)*) = _fetch;
+                    ($($name::fetch_batched($name, _entity_batch, _table_row_start, _len),)*)
+            }
+        }
+
         /// SAFETY: each item in the tuple is read only
         unsafe impl<$($name: ReadOnlyWorldQuery),*> ReadOnlyWorldQuery for ($($name,)*) {}
-
     };
 }
 
@@ -1383,6 +1592,34 @@ macro_rules! impl_anytuple_fetch {
 
         /// SAFETY: each item in the tuple is read only
         unsafe impl<$($name: ReadOnlyWorldQuery),*> ReadOnlyWorldQuery for AnyOf<($($name,)*)> {}
+
+        //FIXME: magic can happen here, too, for different ALIGNments
+        #[allow(unused_variables)]
+        #[allow(non_snake_case)]
+        #[allow(clippy::unused_unit)]
+        impl<const N: usize, $($name: WorldQueryBatch<N>),*> WorldQueryBatch<N> for AnyOf<($($name,)*)>
+        where
+            Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+            $(Align<{ crate::ptr::batch::compute_alignment::<$name, { N }>() }>: Alignment,)*
+        {
+            type FullBatch<'w> = ($(Option<$name::FullBatch<'w>>,)*);
+
+            #[inline]
+            unsafe fn fetch_batched<'w>(
+                _fetch: &mut <Self as WorldQuery>::Fetch<'w>,
+                _entity_batch: &'w AlignedBatch<Entity, N>,
+                _table_row_start: usize,
+                _len: usize,
+            ) -> <Self as WorldQueryBatch<N>>::FullBatch<'w>
+            {
+                let ($($name,)*) = _fetch;
+
+                ($(
+                    $name.1.then(|| $name::fetch_batched(&mut $name.0, _entity_batch, _table_row_start, _len)),
+                )*)
+
+            }
+        }
 
     };
 }

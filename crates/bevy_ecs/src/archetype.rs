@@ -5,7 +5,10 @@ use crate::{
     bundle::BundleId,
     component::{ComponentId, StorageType},
     entity::{Entity, EntityLocation},
-    storage::{ImmutableSparseSet, SparseArray, SparseSet, SparseSetIndex, TableId},
+    storage::{
+        aligned_vec::SimdAlignedVec, ImmutableSparseSet, SparseArray, SparseSet, SparseSetIndex,
+        TableId,
+    },
 };
 use std::{
     collections::HashMap,
@@ -181,7 +184,7 @@ pub struct Archetype {
     id: ArchetypeId,
     table_id: TableId,
     edges: Edges,
-    entities: Vec<ArchetypeEntity>,
+    entities: SimdAlignedVec<ArchetypeEntity>,
     components: ImmutableSparseSet<ComponentId, ArchetypeComponentInfo>,
 }
 
@@ -217,7 +220,7 @@ impl Archetype {
         Self {
             id,
             table_id,
-            entities: Vec::new(),
+            entities: SimdAlignedVec::new(),
             components: components.into_immutable(),
             edges: Default::default(),
         }

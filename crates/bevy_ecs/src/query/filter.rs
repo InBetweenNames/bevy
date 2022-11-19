@@ -2,12 +2,12 @@ use crate::{
     archetype::{Archetype, ArchetypeComponentId},
     component::{Component, ComponentId, ComponentStorage, ComponentTicks, StorageType},
     entity::Entity,
+    ptr::{ThinSimdAlignedSlicePtr, UnsafeCellDeref},
     query::{Access, DebugCheckedUnwrap, FilteredAccess, WorldQuery},
     storage::{ComponentSparseSet, Table},
     world::World,
 };
 use bevy_ecs_macros::all_tuples;
-use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
 use std::{cell::UnsafeCell, marker::PhantomData};
 
 use super::ReadOnlyWorldQuery;
@@ -413,7 +413,7 @@ macro_rules! impl_tick_filter {
         #[doc(hidden)]
         $(#[$fetch_meta])*
         pub struct $fetch_name<'w, T> {
-            table_ticks: Option<ThinSlicePtr<'w, UnsafeCell<ComponentTicks>>>,
+            table_ticks: Option<ThinSimdAlignedSlicePtr<'w, UnsafeCell<ComponentTicks>>>,
             marker: PhantomData<T>,
             sparse_set: Option<&'w ComponentSparseSet>,
             last_change_tick: u32,

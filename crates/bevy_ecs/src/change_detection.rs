@@ -1,7 +1,15 @@
 //! Types that detect when their internal data mutate.
 
+use crate::ptr::{
+    batch::AlignedBatch,
+    elain::{Align, Alignment},
+};
+
 use crate::{component::ComponentTicks, ptr::PtrMut, system::Resource};
-use std::ops::{Deref, DerefMut};
+use std::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+};
 
 /// The (arbitrarily chosen) minimum number of world tick increments between `check_tick` scans.
 ///
@@ -229,6 +237,15 @@ pub(crate) struct Ticks<'a> {
     pub(crate) change_tick: u32,
 }
 
+pub(crate) struct TicksBatch<'a, const N: usize>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    pub(crate) component_ticks: &'a mut AlignedBatch<ComponentTicks, N>,
+    pub(crate) last_change_tick: u32,
+    pub(crate) change_tick: u32,
+}
+
 /// Unique mutable borrow of a [`Resource`].
 ///
 /// See the [`Resource`] documentation for usage.
@@ -351,6 +368,137 @@ where
 change_detection_impl!(Mut<'a, T>, T,);
 impl_methods!(Mut<'a, T>, T,);
 impl_debug!(Mut<'a, T>,);
+
+/// Unique mutable borrow of an entity's component (batched version).
+/// Each batch changes in unison:  a batch has changed if any of its elements have changed.
+pub struct MutBatch<'a, T, const N: usize>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    pub(crate) value: &'a mut AlignedBatch<T, N>,
+    pub(crate) ticks: TicksBatch<'a, N>,
+    pub(crate) _marker: PhantomData<T>,
+}
+
+impl<'a, T, const N: usize> DetectChanges for MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    #[inline]
+    fn is_added(&self) -> bool {
+        self.ticks
+            .component_ticks
+            .as_array()
+            .iter()
+            .any(|x| x.is_added(self.ticks.last_change_tick, self.ticks.change_tick))
+    }
+
+    #[inline]
+    fn is_changed(&self) -> bool {
+        self.ticks
+            .component_ticks
+            .as_array()
+            .iter()
+            .any(|x| x.is_changed(self.ticks.last_change_tick, self.ticks.change_tick))
+    }
+
+    #[inline]
+    fn set_changed(&mut self) {
+        for ticks in self.ticks.component_ticks.as_array_mut().iter_mut() {
+            ticks.set_changed(self.ticks.change_tick);
+        }
+    }
+
+    #[inline]
+    fn last_changed(&self) -> u32 {
+        self.ticks.last_change_tick
+    }
+
+    type Inner = AlignedBatch<T, N>;
+
+    fn set_last_changed(&mut self, last_change_tick: u32) {
+        self.ticks.last_change_tick = last_change_tick;
+    }
+
+    fn bypass_change_detection(&mut self) -> &mut Self::Inner {
+        self.value
+    }
+}
+
+impl<'a, T, const N: usize> Deref for MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    type Target = AlignedBatch<T, N>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.value
+    }
+}
+
+impl<'a, T, const N: usize> DerefMut for MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.set_changed();
+        self.value
+    }
+}
+
+impl<'a, T, const N: usize> AsRef<AlignedBatch<T, N>> for MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    #[inline]
+    fn as_ref(&self) -> &AlignedBatch<T, N> {
+        self.deref()
+    }
+}
+
+impl<'a, T, const N: usize> AsMut<AlignedBatch<T, N>> for MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    #[inline]
+    fn as_mut(&mut self) -> &mut AlignedBatch<T, N> {
+        self.deref_mut()
+    }
+}
+
+impl<'a, T, const N: usize> MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+{
+    /// Consume `self` and return a mutable reference to the
+    /// contained value while marking `self` as "changed".
+    #[inline]
+    pub fn into_inner(mut self) -> &'a mut AlignedBatch<T, N> {
+        self.set_changed();
+        self.value
+    }
+}
+
+impl<'a, T, const N: usize> std::fmt::Debug for MutBatch<'a, T, N>
+where
+    Align<{ crate::ptr::batch::compute_alignment::<T, { N }>() }>: Alignment,
+    Align<{ crate::ptr::batch::compute_alignment::<ComponentTicks, { N }>() }>: Alignment,
+    AlignedBatch<T, N>: std::fmt::Debug,
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple(stringify!($name)).field(&self.value).finish()
+    }
+}
 
 /// Unique mutable borrow of resources or an entity's component.
 ///

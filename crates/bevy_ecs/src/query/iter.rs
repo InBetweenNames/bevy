@@ -2,6 +2,7 @@ use crate::{
     archetype::{ArchetypeEntity, ArchetypeId, Archetypes},
     entity::{Entities, Entity},
     prelude::World,
+    ptr::ThinSimdAlignedSlicePtr,
     query::{ArchetypeFilter, DebugCheckedUnwrap, QueryState, WorldQuery},
     storage::{TableId, Tables},
 };
@@ -469,7 +470,7 @@ impl<'w, 's, Q: ReadOnlyWorldQuery, F: ReadOnlyWorldQuery, const K: usize> Fused
 struct QueryIterationCursor<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> {
     table_id_iter: std::slice::Iter<'s, TableId>,
     archetype_id_iter: std::slice::Iter<'s, ArchetypeId>,
-    table_entities: &'w [Entity],
+    table_entities: ThinSimdAlignedSlicePtr<'w, Entity>,
     archetype_entities: &'w [ArchetypeEntity],
     fetch: Q::Fetch<'w>,
     filter: F::Fetch<'w>,
@@ -540,7 +541,7 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> QueryIterationCursor<'w, 's, 
         QueryIterationCursor {
             fetch,
             filter,
-            table_entities: &[],
+            table_entities: ThinSimdAlignedSlicePtr::dangling(),
             archetype_entities: &[],
             table_id_iter: query_state.matched_table_ids.iter(),
             archetype_id_iter: query_state.matched_archetype_ids.iter(),
@@ -556,7 +557,7 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> QueryIterationCursor<'w, 's, 
         if self.current_index > 0 {
             let index = self.current_index - 1;
             if Self::IS_DENSE {
-                let entity = self.table_entities.get_unchecked(index);
+                let entity = self.table_entities.get(index);
                 Some(Q::fetch(&mut self.fetch, *entity, index))
             } else {
                 let archetype_entity = self.archetype_entities.get_unchecked(index);
@@ -602,7 +603,7 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> QueryIterationCursor<'w, 's, 
 
                 // SAFETY: set_table was called prior.
                 // `current_index` is a table row in range of the current table, because if it was not, then the if above would have been executed.
-                let entity = self.table_entities.get_unchecked(self.current_index);
+                let entity = self.table_entities.get(self.current_index);
                 if !F::filter_fetch(&mut self.filter, *entity, self.current_index) {
                     self.current_index += 1;
                     continue;

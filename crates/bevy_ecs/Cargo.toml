@@ -27,9 +27,12 @@ fixedbitset = "0.4"
 fxhash = "0.2"
 downcast-rs = "1.2"
 serde = { version = "1", features = ["derive"] }
+typenum = {git = "https://github.com/winestone/typenum"}
+gcd = "2"
 
 [dev-dependencies]
 rand = "0.8"
+bevy_math = { path = "../bevy_math", version = "0.9.0-dev" }
 
 [[example]]
 name = "events"

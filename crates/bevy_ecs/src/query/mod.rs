@@ -75,6 +75,9 @@ mod tests {
     #[derive(Component, Debug, Eq, PartialEq, Clone, Copy)]
     struct D(usize);
 
+    #[derive(Component)]
+    struct E;
+
     #[derive(Component, Debug, Eq, PartialEq, Clone, Copy)]
     #[component(storage = "SparseSet")]
     struct Sparse(usize);
@@ -781,6 +784,115 @@ mod tests {
             system.initialize(&mut world);
             system.run((), &mut world);
         }
+    }
+
+    #[test]
+    fn batched_queries() {
+        let mut world = World::new();
+
+        world.spawn_batch(
+            (0..127)
+                .into_iter()
+                .map(|i| (A(4 * i), B(4 * i + 1), C(4 * i + 2), D(4 * i + 3))),
+        );
+
+        fn system_compute(mut q: Query<(&mut A, &B, &C, &D)>) {
+            let mut scalar_counter = 0;
+            let mut batch_counter = 0;
+
+            q.for_each_mut_batched::<4>(
+                |(mut a, b, c, d)| {
+                    assert_eq!(a.ticks.component_ticks.added, 1);
+                    assert_eq!(a.ticks.component_ticks.changed, 1);
+
+                    a.0 += b.0 + c.0 + d.0;
+                    scalar_counter += 1;
+
+                    assert_eq!(a.ticks.component_ticks.added, 1);
+                    assert_eq!(a.ticks.component_ticks.changed, 2);
+                },
+                |(mut a, b, c, d)| {
+                    for ticks in a.ticks.component_ticks.as_array().iter() {
+                        assert_eq!(ticks.added, 1);
+                        assert_eq!(ticks.changed, 1);
+                    }
+
+                    assert_eq!(
+                        *a.as_array(),
+                        [
+                            A(4 * batch_counter),
+                            A(4 * (batch_counter + 1)),
+                            A(4 * (batch_counter + 2)),
+                            A(4 * (batch_counter + 3))
+                        ]
+                    );
+
+                    for (i, mut a_elem) in a.as_array_mut().iter_mut().enumerate() {
+                        a_elem.0 += b.as_array()[i].0 + c.as_array()[i].0 + d.as_array()[i].0;
+                    }
+
+                    for ticks in a.ticks.component_ticks.as_array().iter() {
+                        assert_eq!(ticks.added, 1);
+                        assert_eq!(ticks.changed, 2);
+                    }
+
+                    batch_counter += 4;
+                },
+            );
+
+            assert_eq!(scalar_counter, 3);
+            assert_eq!(batch_counter, 124);
+        }
+        fn system_check(mut q: Query<&A>) {
+            let mut scalar_counter = 0;
+            let mut batch_counter = 0;
+
+            q.for_each_batched::<4>(
+                |a| {
+                    assert_eq!(*a, A(1990 + 16 * scalar_counter));
+
+                    scalar_counter += 1;
+                },
+                |a| {
+                    assert_eq!(
+                        *a.as_array(),
+                        [
+                            A(16 * batch_counter + 6),
+                            A(16 * (batch_counter + 1) + 6),
+                            A(16 * (batch_counter + 2) + 6),
+                            A(16 * (batch_counter + 3) + 6)
+                        ]
+                    );
+
+                    batch_counter += 4;
+                },
+            );
+        }
+
+        world.increment_change_tick();
+
+        let mut system_compute = IntoSystem::into_system(system_compute);
+        system_compute.initialize(&mut world);
+        system_compute.run((), &mut world);
+
+        let mut system_check = IntoSystem::into_system(system_check);
+        system_check.initialize(&mut world);
+        system_check.run((), &mut world);
+    }
+
+    #[test]
+    fn batched_queries_zst() {
+        let mut world = World::new();
+
+        world.spawn_batch((0..127).into_iter().map(|_| E));
+
+        fn system_compute(mut q: Query<&mut E>) {
+            q.for_each_mut_batched::<4>(|mut e| *e = E, |mut e| e.as_array_mut()[1] = E);
+        }
+
+        let mut system_compute = IntoSystem::into_system(system_compute);
+        system_compute.initialize(&mut world);
+        system_compute.run((), &mut world);
     }
 
     #[test]

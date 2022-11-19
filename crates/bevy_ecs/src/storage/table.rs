@@ -2,9 +2,9 @@ use crate::{
     component::{ComponentId, ComponentInfo, ComponentTicks, Components},
     entity::Entity,
     query::DebugCheckedUnwrap,
-    storage::{blob_vec::BlobVec, ImmutableSparseSet, SparseSet},
+    storage::{aligned_vec::SimdAlignedVec, blob_vec::BlobVec, ImmutableSparseSet, SparseSet},
 };
-use bevy_ptr::{OwningPtr, Ptr, PtrMut};
+use bevy_ptr::{OwningPtr, Ptr, PtrMut, ThinSimdAlignedSlicePtr};
 use bevy_utils::HashMap;
 use std::alloc::Layout;
 use std::{
@@ -35,7 +35,7 @@ impl TableId {
 #[derive(Debug)]
 pub struct Column {
     data: BlobVec,
-    ticks: Vec<UnsafeCell<ComponentTicks>>,
+    ticks: SimdAlignedVec<UnsafeCell<ComponentTicks>>,
 }
 
 impl Column {
@@ -44,7 +44,7 @@ impl Column {
         Column {
             // SAFETY: component_info.drop() is valid for the types that will be inserted.
             data: unsafe { BlobVec::new(component_info.layout(), component_info.drop(), capacity) },
-            ticks: Vec::with_capacity(capacity),
+            ticks: SimdAlignedVec::with_capacity(capacity),
         }
     }
 
@@ -187,13 +187,13 @@ impl Column {
 
     /// # Safety
     /// The type `T` must be the type of the items in this column.
-    pub unsafe fn get_data_slice<T>(&self) -> &[UnsafeCell<T>] {
+    pub unsafe fn get_data_slice<T>(&self) -> ThinSimdAlignedSlicePtr<UnsafeCell<T>> {
         self.data.get_slice()
     }
 
     #[inline]
-    pub fn get_ticks_slice(&self) -> &[UnsafeCell<ComponentTicks>] {
-        &self.ticks
+    pub fn get_ticks_slice(&self) -> ThinSimdAlignedSlicePtr<UnsafeCell<ComponentTicks>> {
+        self.ticks.get_slice()
     }
 
     #[inline]
@@ -296,7 +296,7 @@ impl TableBuilder {
     pub fn build(self) -> Table {
         Table {
             columns: self.columns.into_immutable(),
-            entities: Vec::with_capacity(self.capacity),
+            entities: SimdAlignedVec::with_capacity(self.capacity),
         }
     }
 }
@@ -315,13 +315,13 @@ impl TableBuilder {
 /// [`World`]: crate::world::World
 pub struct Table {
     columns: ImmutableSparseSet<ComponentId, Column>,
-    entities: Vec<Entity>,
+    entities: SimdAlignedVec<Entity>,
 }
 
 impl Table {
     #[inline]
-    pub fn entities(&self) -> &[Entity] {
-        &self.entities
+    pub fn entities(&self) -> ThinSimdAlignedSlicePtr<'_, Entity> {
+        self.entities.get_slice()
     }
 
     /// Removes the entity at the given row and returns the entity swapped in to replace it (if an
@@ -497,6 +497,20 @@ impl Table {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
+    }
+
+    #[inline]
+    pub fn batchable_region_end<const N: usize>(&self) -> usize {
+        //Critical invariant: each Component storage is aligned to MAX_SIMD_ALIGNMENT
+        //and each component in the query can be batched e.g., for (Q1, Q2), both Q1 and Q2 issue aligned batches
+        //Therefore, for the given query, the batch size of N is valid.
+
+        //The components are divided into [batchable region][scalar region]
+        //Given the above invariants, the euclidian division of table.len() = bN + s, 0 <= s < N, gives
+        //b batches with a scalar region of s
+        //Therefore, the batch region of indices is from [0, bN), and the scalar is [bN, table.len())
+
+        (self.entity_count() / N) * N
     }
 
     pub(crate) fn check_change_ticks(&mut self, change_tick: u32) {

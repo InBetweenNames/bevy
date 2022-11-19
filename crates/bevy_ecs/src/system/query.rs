@@ -1,9 +1,11 @@
 use crate::{
     component::Component,
     entity::Entity,
+    ptr::elain::{Align, Alignment},
     query::{
-        QueryCombinationIter, QueryEntityError, QueryIter, QueryManyIter, QuerySingleError,
-        QueryState, ROQueryItem, ReadOnlyWorldQuery, WorldQuery,
+        QueryBatch, QueryCombinationIter, QueryEntityError, QueryItem, QueryIter, QueryManyIter,
+        QuerySingleError, QueryState, ROQueryBatch, ROQueryItem, ReadOnlyWorldQuery, WorldQuery,
+        WorldQueryBatch,
     },
     world::{Mut, World},
 };
@@ -687,6 +689,29 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> Query<'w, 's, Q, F> {
         };
     }
 
+    /// See [`QueryState<Q,F>::for_each_batched`](QueryState<Q,F>::for_each_batched) for how to use this function.
+    #[inline]
+    pub fn for_each_batched<'a, const N: usize>(
+        &'a mut self,
+        func: impl FnMut(ROQueryItem<'a, Q>),
+        func_batch: impl FnMut(ROQueryBatch<'a, Q, N>),
+    ) where
+        Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+        <Q as WorldQuery>::ReadOnly: WorldQueryBatch<N>,
+    {
+        // SAFETY: system runs without conflicts with other systems. same-system queries have runtime
+        // borrow checks when they conflict
+        unsafe {
+            self.state.as_readonly().for_each_unchecked_manual_batched(
+                self.world,
+                func,
+                func_batch,
+                self.last_change_tick,
+                self.change_tick,
+            );
+        };
+    }
+
     /// Runs `f` on each query item.
     ///
     /// # Example
@@ -719,6 +744,232 @@ impl<'w, 's, Q: WorldQuery, F: ReadOnlyWorldQuery> Query<'w, 's, Q, F> {
             self.state.for_each_unchecked_manual(
                 self.world,
                 f,
+                self.last_change_tick,
+                self.change_tick,
+            );
+        };
+    }
+
+    /// This is a "batched" version of [`for_each_mut`](Self::for_each_mut) that accepts a batch size `N` together with a desired alignment for the batches `ALIGN`.
+    /// The advantage of using batching in queries is that it enables SIMD acceleration (vectorization) of your code to help you meet your performance goals.
+    /// This function accepts two arguments, `func`, and `func_batch` which represent the "scalar" and "vector" (or "batched") paths of your code respectively.
+    /// Each "batch" contains `N` query results, in order, with a guaranteed alignment for the batch to aid in vectorization of the query.
+    ///
+    /// # A very brief introduction to SIMD
+    ///
+    /// SIMD, or Single Instruction, Multiple Data, is a paradigm that allows a single instruction to operate on multiple datums in parallel.
+    /// It is most commonly seen in "vector" instruction set extensions such as AVX and NEON, where it is possible to, for example, add
+    /// two arrays of `[f32; 4]` together in a single instruction.  When used appropriately, SIMD is a very powerful tool that can greatly accelerate certain types of workloads.
+    /// An introductory treatment of SIMD can be found [on Wikipedia](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) for interested readers.
+    ///
+    /// [Vectorization](https://stackoverflow.com/questions/1422149/what-is-vectorization) is an informal term to describe optimizing code to leverage these SIMD instruction sets.
+    ///
+    /// # Just what is this alignment thing, anyway?
+    ///
+    /// [This chapter](https://doc.rust-lang.org/reference/type-layout.html) of the Rust reference is a great treatment on alignment.
+    ///
+    /// Vector instructions often come with memory operand alignment restrictions that make their usage more complicated, and these
+    /// are typically based on the vector size in bytes.  For example, a `[f32; 4]` vector is 16 bytes long, and in SSE4 some instructions
+    /// taking a `[f32; 4]` memory operand require it to be 16 bytes aligned.  "Unaligned moves" are possible, but may carry a performance
+    /// penalty under certain circumstances.  If the compiler can't prove that a memory operand will be aligned appropriately, it must assume
+    /// the worst case and emit code expecting unaligned data.
+    ///
+    /// Fortunately, you can provide a guaranteed batch alignment using the `ALIGN` parameter.  This ensures that your batch
+    /// alignment is at least `ALIGN` (a compile-time assertion ensures if this is not possible, the build cannot succeed).
+    /// The result is that the Rust compiler can directly see that your reads and writes are aligned appropriately
+    /// and enable usage of vector instructions with aligned memory operands. That is, Bevy proves that memory operands will be aligned to at least `ALIGN`,
+    /// enabling greater optimization potential, and also helping you if you choose to write SIMD intrinsics directly.
+    ///
+    /// When generalized const expressions are stable, the guaranteed alignment of your batch will be calculated for you automatically
+    /// and you won't need to pass in the `ALIGN` parameter.
+    ///
+    /// # When should I consider batching for my query?
+    ///
+    /// The first thing you should consider is if you are meeting your performance goals.  Batching a query is fundamentally an optimization, and if your application is meeting performance requirements
+    /// already, then (other than for your own entertainment) you won't get much benefit out of batching.  If you are having performance problems though, the next step is to
+    /// use a [profiler](https://nnethercote.github.io/perf-book/profiling.html) to determine the running characteristics of your code.
+    /// If, after profiling your code, you have determined that a substantial amount of time is being processing a query, and it's hindering your performance goals,
+    /// then it might be worth it to consider batching to meet them.
+    ///
+    /// One of the main tradeoffs with batching your queries is that there will be an increased complexity from maintaining both code paths: `func` and `func_batch`
+    /// semantically should be doing the same thing, and it should always be possible to interchange them without visible program effects.
+    ///
+    /// # What kinds of queries make sense to batch?
+    ///
+    /// Usually math related ones: an example is given below showing how to accelerate a simple `position += velocity * time` calculation using batching.
+    /// Anything involving floats is a possible candidate.  Depending on your component layout, you may need to perform a data layout conversion
+    /// to batch the query optimally.  This Wikipedia page on ["array of struct" and "struct of array" layouts](https://en.wikipedia.org/wiki/AoS_and_SoA) is a good starter on
+    /// this topic, as is this [Intel blog post](https://www.intel.com/content/www/us/en/developer/articles/technical/memory-layout-transformations.html).
+    /// The example below uses data layout conversion.
+    ///
+    /// Vectorizing code can be a very deep subject to get into.
+    /// Sometimes it can be very straightfoward to accomplish what you want to do, and other times it takes a bit of playing around to make your problem fit the SIMD model.
+    ///
+    /// # Will batching always make my queries faster?
+    ///
+    /// Unfortunately it will not.  A suboptimally written batched query will probably perform worse than a straightforward `for_each_mut` query.  Data layout conversion,
+    /// for example, carries overhead that may not always be worth it. Fortunately, your profiler can help you identify these situations.
+    ///
+    /// Think of batching as a tool in your performance toolbox rather than the preferred way of writing your queries.
+    ///
+    /// # What kinds of queries are batched right now?
+    ///
+    /// Currently, only "Dense" queries are actually batched; other queries will only use `func` and never call `func_batch`.  This will improve
+    /// in the future.
+    ///
+    /// # Usage:
+    ///
+    /// * Supported values of `ALIGN` are 16, 32, and 64
+    /// * `N` must be a power of 2
+    /// * `func_batch` receives components in "batches" that are aligned to `ALIGN`.
+    /// * `func` functions exactly as does in [`for_each_mut`](Self::for_each_mut) -- it receives "scalar" (non-batched) components.
+    ///
+    /// In other words, `func_batch` composes the "fast path" of your query, and `func` is the "slow path".
+    ///
+    /// Batches are currently one of [`AlignedBatch16`](bevy_ptr::batch::AlignedBatch16), [`AlignedBatch32`](bevy_ptr::batch::AlignedBatch32),
+    /// or [`AlignedBatch64`](bevy_ptr::batch::AlignedBatch64) types, each corresponding to a guaranteed batch alignment.
+    /// The batch alignment is important as it enables architecture-specific optimizations that depend on alignment.
+    ///
+    /// If you attempt to call this function with an invalid generic argument, a compile-time error will be issued.  For example,
+    /// if you request 64-bytes alignment on a batch whose size is 8 bytes, your program will fail to compile.  In general,
+    /// choose `ALIGN` as large as you can for your batch parameters.  The minimum alignment supported for batches is 16 bytes.
+    ///
+    /// **Note**: Once generalized const expressions are stable, it will be possible to compute `ALIGN` automatically based on the component type and batch size.
+    /// Compile-time assertions will still exist for sanity checking.
+    ///
+    /// In general, when using this function, be mindful of the types of filters being used with your query, as these can fragment your batches
+    /// and cause the scalar path to be taken more often.
+    ///
+    /// **Note**: It is always valid for the implementation of this function to only call `func`.  Currently, batching is only supported for "Dense" queries.
+    /// Calling this function on any other query type will result in only the slow path being executed (e.g., queries with Sparse components.)
+    /// More query types may become batchable in the future.
+    ///
+    /// **Note**: Although this function provides the groundwork for writing performance-portable SIMD code, you will still need to take into account
+    /// your target architecture's capabilities.  The batch size will likely need to be tuned for your application, for example.
+    /// When SIMD becomes stabilized in Rust, it will be possible to write code that is generic over the batch width, but some degree of tuning will likely always be
+    /// necessary.  Think of this as a tool at your disposal to meet your performance goals.
+    ///
+    ///  # Example: Acclerate a simple "`Position += Velocity * time`" calculation using SIMD, where Position and Velocity are represented using `Vec3`s.
+    ///  A batch width of 4 is chosen to match SSE4 and allow the usage of the `Vec4` type to perform SIMD.  This example uses the [`as_inner`](bevy_ptr::batch::AlignedBatch16<f32,4>::as_inner)
+    ///  functions to easily and efficiently process components with a single member.
+    ///
+    /// ```rust
+    /// #![feature(generic_const_exprs)]
+    /// use bevy_ecs::prelude::*;
+    /// use bevy_ptr::batch::AlignedBatch;
+    /// use bevy_ptr::bytemuck::TransparentWrapper;
+    /// use bevy_math::{Vec3,Vec4};
+    ///
+    /// #[derive(Clone, Copy, Component, PartialEq, Debug)]
+    /// //We want repr(transparent) here to access the `as_inner` AlignedBatch functions.
+    /// #[repr(transparent)]
+    /// struct Position(Vec3);
+    ///
+    /// //Important: this allows us to "cast away" the outer layer of Position
+    /// // SAFETY: Position is repr(transparent) and contains a Vec3
+    /// unsafe impl TransparentWrapper<Vec3> for Position {}
+    ///
+    /// #[derive(Clone, Copy, Component, PartialEq, Debug)]
+    /// //We want repr(transparent) here to access the `as_inner` AlignedBatch functions.
+    /// #[repr(transparent)]
+    /// struct Velocity(Vec3);
+    ///
+    /// //Important: this allows us to "cast away" the outer layer of Velocity
+    /// // SAFETY: Velocity is repr(transparent) and contains a Vec3
+    /// unsafe impl TransparentWrapper<Vec3> for Velocity {}
+    ///
+    /// //Convert the AoS representation to an SoA representation amenable to SIMD operations
+    /// //This uses the `AsRef` trait to generically deal with different alignments
+    /// //on size 4 batches.
+    /// fn aos_to_soa(aos: &impl AsRef<[Vec3; 4]>) -> [Vec4; 3]
+    /// {
+    ///     let [p0, p1, p2, p3] = aos.as_ref();
+    ///
+    ///     let xs = Vec4::new(p0.x, p1.x, p2.x, p3.x);
+    ///     let ys = Vec4::new(p0.y, p1.y, p2.y, p3.y);
+    ///     let zs = Vec4::new(p0.z, p1.z, p2.z, p3.z);
+    ///
+    ///     [xs, ys, zs]
+    /// }
+    ///
+    /// //Convert the SoA representation back to AoS for storing back into the ECS.
+    /// fn soa_to_aos(aos: &[Vec4; 3]) -> [Vec3; 4]
+    /// {
+    ///     let [xs, ys, zs] = aos;
+    ///
+    ///     let p0 = Vec3::new(xs.x, ys.x, zs.x);
+    ///     let p1 = Vec3::new(xs.y, ys.y, zs.y);
+    ///     let p2 = Vec3::new(xs.z, ys.z, zs.z);
+    ///     let p3 = Vec3::new(xs.w, ys.w, zs.w);
+    ///
+    ///     [p0, p1, p2, p3]
+    /// }
+    ///
+    /// const DELTA_TIMESTEP: f32 = 1.0/60.0;
+    ///
+    /// fn position_update_system(mut query: Query<(&mut Position, &Velocity)>)
+    /// {
+    ///     //Execute this query in batches of 4 components with an alignment of 16.
+    ///     //Note that if this is not possible, the program will fail to compile.
+    ///     //Try changing "16" to "32" here, for example, and observe what happens.
+    ///     //In the future, the alignment will able to be computed for you when
+    ///     //generic const expressions are stable.
+    ///     query.for_each_mut_batched::<4>(|(mut position, velocity)|
+    ///     {
+    ///         //The scalar path -- this is only executed for the epilogue or for when
+    ///         //filters are present that would fragment the query
+    ///         position.0 += DELTA_TIMESTEP * velocity.0;
+    ///     },
+    ///     |(mut position, velocity)|
+    ///     {
+    ///         //The batched path -- `position` and `velocity` are now AlignedBatch types.
+    ///         //This uses SIMD to perform the calculation.
+    ///         //Note that this example is designed around SSE4.
+    ///         //For AVX2, for example, you would want batches of 8 `f32`s.
+    ///         //When SIMD is stabilized in rust, it could be replaced with generic vector-width code.
+    ///
+    ///         //NOTE: change trackers currently will add overhead.
+    ///         //If this is a problem, uncomment the below:
+    ///         //let position = position.bypass_change_detection();
+    ///
+    ///         //This lets us treat our batch of Position as a batch of Vec3
+    ///         let mut ps = position.as_inner_mut::<Vec3>();
+    ///
+    ///         // Turn [Vec3; 4] into [Vec4; 3] form for SIMD acceleration
+    ///         let [ps_x, ps_y, ps_z] = aos_to_soa(ps);
+    ///         let [vs_x, vs_y, vs_z] = aos_to_soa(velocity.as_inner::<Vec3>());
+    ///         //NOTE: the above can also be achieved similarly using velocity.map(|c| c.0)
+    ///
+    ///         //Now that we have our [Vec4; 3], this line will optimize well using SIMD
+    ///         let newps = [ps_x + vs_x * DELTA_TIMESTEP,
+    ///                      ps_y + vs_y * DELTA_TIMESTEP,
+    ///                      ps_z + vs_z * DELTA_TIMESTEP];
+    ///
+    ///         //But our intermediate work is still in SoA representation!
+    ///         //We still need to translate it back.
+    ///         //"into" is used to convert the [Vec3; 4] into an AlignedBatch16<Vec3, 4>.
+    ///         //It *should* optimize right out.
+    ///         *ps = soa_to_aos(&newps).into();
+    ///     });
+    /// }
+    /// # bevy_ecs::system::assert_is_system(position_update_system);
+    /// ```
+    #[inline]
+    pub fn for_each_mut_batched<'a, const N: usize>(
+        &'a mut self,
+        func: impl FnMut(QueryItem<'a, Q>),
+        func_batch: impl FnMut(QueryBatch<'a, Q, N>),
+    ) where
+        Align<{ crate::ptr::batch::compute_alignment::<Entity, { N }>() }>: Alignment,
+        Q: WorldQueryBatch<N>,
+    {
+        // SAFETY: system runs without conflicts with other systems. same-system queries have runtime
+        // borrow checks when they conflict
+        unsafe {
+            self.state.for_each_unchecked_manual_batched(
+                self.world,
+                func,
+                func_batch,
                 self.last_change_tick,
                 self.change_tick,
             );
